@@ -1,6 +1,6 @@
 <?php if (!defined('ABSPATH')) { http_response_code(404); exit; } ?>
 <!doctype html>
-<html lang="es">
+<html lang="es" data-v="{{VER}}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -286,6 +286,12 @@ input:focus,textarea:focus,a:focus-visible,button:focus-visible{outline:3px soli
 <p id="form-status" role="status" aria-live="polite" style="margin: 0; min-height: 22px; font-size: 15px; font-weight: 600; color: #14213A"></p>
 <button type="submit" style="display: inline-flex; align-items: center; justify-content: center; min-height: 48px; padding: 0 26px; border-radius: 6px; font-family: Montserrat, sans-serif; font-weight: 700; font-size: 15px; text-decoration: none; box-sizing: border-box; align-self: flex-start; border: 0; background: #0B5FC4; color: #FFFFFF; cursor: pointer">Enviar mensaje</button>
 </form>
+<div id="form-done" role="status" aria-live="polite" tabindex="-1" hidden style="flex: 1 1 520px; min-width: 0; box-sizing: border-box; background: #FFFFFF; border: 1px solid #D9E2EE; border-radius: 8px; padding: 36px; flex-direction: column; gap: 14px; justify-content: center">
+<svg aria-hidden="true" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#0B5FC4" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9.5"></circle><path d="M7.5 12.5l3 3 6-7"></path></svg>
+<h3 style="margin: 0; font-family: Montserrat, sans-serif; font-weight: 700; font-size: 24px; color: #14213A">Mensaje enviado</h3>
+<p style="margin: 0; font-size: 17px; line-height: 1.6; color: #3D4A60">Gracias por contactar a JUCCA LLC. Le responderemos pronto.</p>
+<p style="margin: 0; font-size: 15px; line-height: 1.6; color: #3D4A60">Le enviamos una confirmación a su correo electrónico.</p>
+</div>
 </div>
 </section>
 
@@ -310,20 +316,79 @@ input:focus,textarea:focus,a:focus-visible,button:focus-visible{outline:3px soli
     burger.setAttribute("aria-expanded", open ? "true" : "false");
   });
   document.querySelectorAll("#site-nav a, .site-actions a").forEach(function (a) { a.addEventListener("click", closeMenu); });
-  var form = document.getElementById("contact-form"), status = document.getElementById("form-status"), loadedAt = Date.now();
+  // Contact form. Before sending, the page asks the server for a one-time token and solves a small
+  // computing puzzle with it. Real browsers do this unnoticed; scripts that post to the form directly fail.
+  var form = document.getElementById("contact-form"), status = document.getElementById("form-status"), done = document.getElementById("form-done");
+  var url = form.getAttribute("action"), pending = null;
+  function post(fields) {
+    var d = fields instanceof FormData ? fields : new FormData();
+    if (!(fields instanceof FormData)) { Object.keys(fields).forEach(function (k) { d.append(k, fields[k]); }); }
+    return fetch(url, { method: "POST", headers: { Accept: "application/json" }, body: d, credentials: "same-origin" }).then(function (r) { return r.json(); });
+  }
+  function solve(token, bits) {
+    var enc = new TextEncoder(), n = 0;
+    function step() {
+      return crypto.subtle.digest("SHA-256", enc.encode(token + ":" + n)).then(function (buf) {
+        var b = new Uint8Array(buf), zero = 0;
+        for (var i = 0; i < b.length && zero < bits; i++) {
+          if (b[i] === 0) { zero += 8; continue; }
+          zero += Math.clz32(b[i]) - 24; break;
+        }
+        if (zero >= bits) { return String(n); }
+        n++;
+        return n % 500 === 0 ? new Promise(function (r) { setTimeout(r, 0); }).then(step) : step();
+      });
+    }
+    return step();
+  }
+  function prepare() {
+    if (pending) { return pending; }
+    pending = post({ action: "jucca_token" }).then(function (j) {
+      var at = Date.now();
+      return solve(j.token, j.bits).then(function (answer) { return { token: j.token, answer: answer, at: at }; });
+    });
+    pending.catch(function () { pending = null; });
+    return pending;
+  }
+  // The host lets browsers keep this page for a month. Once per visit, ask the server which
+  // version is current and reload if this copy is older, so updates reach returning visitors.
+  try {
+    var V = document.documentElement.getAttribute("data-v");
+    if (sessionStorage.getItem("jucca-v") !== V) {
+      post({ action: "jucca_version" }).then(function (j) {
+        if (!j || !j.v) { return; }
+        if (j.v !== V && sessionStorage.getItem("jucca-reloaded") !== j.v) { sessionStorage.setItem("jucca-reloaded", j.v); location.reload(); }
+        else { sessionStorage.setItem("jucca-v", V); }
+      }).catch(function () {});
+    }
+  } catch (e) {}
+  form.addEventListener("focusin", prepare, { once: true });
+  form.addEventListener("pointerdown", prepare, { once: true });
+  function send(retry) {
+    return prepare().then(function (t) {
+      // The server refuses tokens younger than 4 seconds, so wait out the remainder.
+      var wait = Math.max(0, 4500 - (Date.now() - t.at));
+      return new Promise(function (r) { setTimeout(r, wait); }).then(function () {
+        var data = new FormData(form);
+        data.append("token", t.token); data.append("answer", t.answer);
+        data.append("lang", document.documentElement.lang === "es" ? "es" : "en");
+        pending = null;
+        return post(data);
+      });
+    }).then(function (j) {
+      if (j && j.success === true) { return true; }
+      if (j && (j.error === "verify" || j.error === "wait") && retry) { return send(false); }
+      return false;
+    });
+  }
   form.addEventListener("submit", function (e) {
     e.preventDefault();
-    var data = new FormData(form), elapsed = Date.now() - loadedAt;
-    if (data.get("website") || elapsed < 3000) { status.textContent = M.ok; form.reset(); return; }
-    data.append("elapsed", String(elapsed));
-    data.append("lang", document.documentElement.lang === "es" ? "es" : "en");
     var btn = form.querySelector('button[type="submit"]');
     btn.disabled = true; status.textContent = M.sending;
-    fetch(form.getAttribute("action"), { method: "POST", headers: { Accept: "application/json" }, body: data, credentials: "same-origin" })
-      .then(function (r) { return r.json().then(function (j) { return r.ok && j.success === true; }); })
-      .then(function (ok) { status.textContent = ok ? M.ok : M.fail; if (ok) { form.reset(); loadedAt = Date.now(); } })
-      .catch(function () { status.textContent = M.fail; })
-      .then(function () { btn.disabled = false; });
+    send(true).then(function (ok) {
+      if (ok) { form.reset(); form.hidden = true; form.style.display = "none"; done.hidden = false; done.style.display = "flex"; done.focus(); }
+      else { status.textContent = M.fail; }
+    }).catch(function () { status.textContent = M.fail; }).then(function () { btn.disabled = false; });
   });
 })();
 </script>

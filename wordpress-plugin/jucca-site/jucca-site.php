@@ -2,15 +2,18 @@
 /**
  * Plugin Name: JUCCA LLC Site
  * Description: Serves the JUCCA LLC one-page website in English (/) and Spanish (/es/), with its contact form, sitemap and sharing tags. Deactivate to return to the regular WordPress theme.
- * Version: 1.0.2
+ * Version: 1.1.1
  * Author: Worldwise Ventures
  * Requires PHP: 7.2
  */
 
 if (!defined('ABSPATH')) { exit; }
 
+define('JUCCA_SITE_VERSION', '1.1.1');
 define('JUCCA_SITE_TO', 'juccallc@yahoo.com');   // where contact form messages are delivered
 define('JUCCA_SITE_MAX_PER_HOUR', 5);            // per visitor IP
+define('JUCCA_SITE_MAX_TOTAL_PER_HOUR', 40);     // all visitors together
+define('JUCCA_SITE_POW_BITS', 14);               // difficulty of the browser puzzle
 
 /* ---------------------------------------------------------------------------
  * Routing: "/" serves English, "/es/" serves Spanish, "/sitemap.xml" the sitemap.
@@ -75,7 +78,10 @@ function jucca_site_serve($lang) {
         '{{HOME_ES}}' => esc_url(home_url('/es/')),
         '{{HOME}}'    => esc_url(home_url('/')),
         '{{AJAX}}'    => esc_url(admin_url('admin-ajax.php')),
+        '{{VER}}'     => JUCCA_SITE_VERSION,
     ));
+    // Version the photo and logo addresses so a replaced file is not hidden by the host's month-long cache.
+    $html = preg_replace('#(/(?:images|assets)/[A-Za-z0-9\-]+\.(?:jpg|png))#', '$1?v=' . JUCCA_SITE_VERSION, $html);
     status_header(200);
     header('Content-Type: text/html; charset=UTF-8');
     header('Content-Language: ' . ($lang === 'es' ? 'es' : 'en-US'));
@@ -148,12 +154,68 @@ add_filter('robots_txt', function ($output) {
 /* ---------------------------------------------------------------------------
  * Contact form. Posted to admin-ajax.php with action=jucca_contact.
  * ------------------------------------------------------------------------- */
+function jucca_site_version() {
+    nocache_headers();
+    wp_send_json(array('v' => JUCCA_SITE_VERSION));
+}
+add_action('wp_ajax_nopriv_jucca_version', 'jucca_site_version');
+add_action('wp_ajax_jucca_version', 'jucca_site_version');
+
+/* Anti-spam, layer by layer:
+ *  1. One-time signed token. The page must ask this server for it first.
+ *  2. Proof of work. The browser solves a small puzzle tied to the token.
+ *  3. Minimum time. A token younger than 4 seconds is refused.
+ *  4. Hidden "website" field that only bots fill in.
+ *  5. Link limit, and no links at all in the name or company.
+ *  6. Rate limits per visitor and for the whole site.
+ *  7. The confirmation email never repeats anything the visitor typed, and each
+ *     address gets at most one per day, so the form cannot be used to mail strangers.
+ */
+function jucca_site_token() {
+    $ts   = time();
+    $rand = bin2hex(random_bytes(8));
+    $sig  = hash_hmac('sha256', $ts . '.' . $rand, wp_salt('nonce'));
+    nocache_headers();
+    wp_send_json(array('token' => $ts . '.' . $rand . '.' . $sig, 'bits' => JUCCA_SITE_POW_BITS));
+}
+add_action('wp_ajax_nopriv_jucca_token', 'jucca_site_token');
+add_action('wp_ajax_jucca_token', 'jucca_site_token');
+
+/** Returns '' when the token and puzzle answer are valid, otherwise a short error code. */
+function jucca_site_check_token($token, $answer) {
+    $parts = explode('.', (string) $token);
+    if (count($parts) !== 3 || !ctype_digit($parts[0]) || !preg_match('/^[a-f0-9]{16}$/', $parts[1])) { return 'verify'; }
+    $expected = hash_hmac('sha256', $parts[0] . '.' . $parts[1], wp_salt('nonce'));
+    if (!hash_equals($expected, (string) $parts[2])) { return 'verify'; }
+    $age = time() - (int) $parts[0];
+    if ($age < 4) { return 'wait'; }
+    if ($age > 2 * HOUR_IN_SECONDS) { return 'verify'; }
+    if (!preg_match('/^\d{1,12}$/', (string) $answer)) { return 'verify'; }
+    $hash = hash('sha256', $token . ':' . $answer, true);
+    $bits = 0;
+    for ($i = 0; $i < strlen($hash) && $bits < JUCCA_SITE_POW_BITS; $i++) {
+        $byte = ord($hash[$i]);
+        if ($byte === 0) { $bits += 8; continue; }
+        for ($m = 0x80; $m > 0 && !($byte & $m); $m >>= 1) { $bits++; }
+        break;
+    }
+    if ($bits < JUCCA_SITE_POW_BITS) { return 'verify'; }
+    $used = 'jucca_tok_' . md5($token);
+    if (get_transient($used)) { return 'verify'; }
+    set_transient($used, 1, 2 * HOUR_IN_SECONDS);
+    return '';
+}
+
 function jucca_site_contact() {
+    nocache_headers();
     $post = wp_unslash($_POST);
     $get  = function ($k) use ($post) { return isset($post[$k]) && is_string($post[$k]) ? $post[$k] : ''; };
 
-    // Spam checks. Honeypot and time trap pretend to succeed so bots learn nothing.
-    if ($get('website') !== '' || (int) $get('elapsed') < 3000) { wp_send_json(array('success' => true)); }
+    // Hidden field: pretend to succeed so bots learn nothing.
+    if ($get('website') !== '') { wp_send_json(array('success' => true)); }
+
+    $bad = jucca_site_check_token($get('token'), $get('answer'));
+    if ($bad !== '') { wp_send_json(array('success' => false, 'error' => $bad), 200); }
 
     $name    = mb_substr(sanitize_text_field($get('name')), 0, 120);
     $company = mb_substr(sanitize_text_field($get('company')), 0, 160);
@@ -161,33 +223,50 @@ function jucca_site_contact() {
     $message = mb_substr(sanitize_textarea_field($get('message')), 0, 6000);
     $lang    = $get('lang') === 'es' ? 'es' : 'en';
 
-    if ($name === '' || $message === '' || !is_email($email)) { wp_send_json(array('success' => false, 'error' => 'invalid'), 422); }
+    if ($name === '' || $message === '' || !is_email($email)) { wp_send_json(array('success' => false, 'error' => 'invalid'), 200); }
 
-    // More than two links in a first message is almost always spam.
-    if (preg_match_all('#https?://|www\.#i', $message . ' ' . $name . ' ' . $company) > 2) { wp_send_json(array('success' => true)); }
+    // Links: none in the name or company, at most two in the message.
+    $link = '#https?://|www\.|\[url|<a\s#i';
+    if (preg_match($link, $name . ' ' . $company) || preg_match_all($link, $message) > 2) { wp_send_json(array('success' => true)); }
 
-    // Rate limit per IP.
-    $ip   = isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : 'unknown';
+    // Rate limits.
+    $ip   = isset($_SERVER['HTTP_CF_CONNECTING_IP']) ? (string) $_SERVER['HTTP_CF_CONNECTING_IP'] : (isset($_SERVER['REMOTE_ADDR']) ? (string) $_SERVER['REMOTE_ADDR'] : 'unknown');
     $key  = 'jucca_form_' . md5($ip);
     $hits = (int) get_transient($key);
-    if ($hits >= JUCCA_SITE_MAX_PER_HOUR) { wp_send_json(array('success' => false, 'error' => 'rate'), 429); }
+    $all  = (int) get_transient('jucca_form_all');
+    if ($hits >= JUCCA_SITE_MAX_PER_HOUR || $all >= JUCCA_SITE_MAX_TOTAL_PER_HOUR) { wp_send_json(array('success' => false, 'error' => 'rate'), 200); }
     set_transient($key, $hits + 1, HOUR_IN_SECONDS);
+    set_transient('jucca_form_all', $all + 1, HOUR_IN_SECONDS);
 
     $host = preg_replace('/^www\./', '', (string) parse_url(home_url('/'), PHP_URL_HOST));
+    $from = 'From: JUCCA LLC <website@' . $host . '>';
+
+    // 1. Notification to JUCCA.
     $subject = 'New message from the JUCCA LLC website: ' . $name;
     $body  = "Name: $name\n";
     $body .= 'Company: ' . ($company !== '' ? $company : '-') . "\n";
     $body .= "Email: $email\n";
     $body .= 'Page language: ' . ($lang === 'es' ? 'Spanish' : 'English') . "\n\n";
     $body .= "Message:\n$message\n\n--\nSent from the contact form on $host\n";
-    $headers = array(
-        'Content-Type: text/plain; charset=UTF-8',
-        'From: JUCCA LLC website <website@' . $host . '>',
-        'Reply-To: ' . $name . ' <' . $email . '>',
-    );
+    $sent = wp_mail(JUCCA_SITE_TO, $subject, $body, array('Content-Type: text/plain; charset=UTF-8', $from, 'Reply-To: ' . $name . ' <' . $email . '>'));
 
-    $sent = wp_mail(JUCCA_SITE_TO, $subject, $body, $headers);
-    wp_send_json(array('success' => (bool) $sent, 'error' => $sent ? '' : 'mail'), $sent ? 200 : 500);
+    // 2. Confirmation to the visitor. Fixed text only, once per address per day.
+    if ($sent && strtolower($email) !== strtolower(JUCCA_SITE_TO)) {
+        $once = 'jucca_ack_' . md5(strtolower($email));
+        if (!get_transient($once)) {
+            set_transient($once, 1, DAY_IN_SECONDS);
+            if ($lang === 'es') {
+                $ack_subject = 'Recibimos su mensaje | JUCCA LLC';
+                $ack_body = "Hola:\n\nGracias por contactar a JUCCA LLC. Recibimos su mensaje y le responderemos pronto.\n\nEste es un mensaje automático de confirmación. Si usted no completó el formulario de contacto en $host, puede ignorarlo.\n\nJUCCA LLC\nImportación · Exportación · Comercio global\nhttps://$host/es/\n";
+            } else {
+                $ack_subject = 'We received your message | JUCCA LLC';
+                $ack_body = "Hello,\n\nThank you for contacting JUCCA LLC. We received your message and will get back to you soon.\n\nThis is an automatic confirmation. If you did not fill in the contact form on $host, you can ignore it.\n\nJUCCA LLC\nImport · Export · Global Trade\nhttps://$host/\n";
+            }
+            wp_mail($email, $ack_subject, $ack_body, array('Content-Type: text/plain; charset=UTF-8', $from, 'Reply-To: JUCCA LLC <' . JUCCA_SITE_TO . '>', 'Auto-Submitted: auto-replied', 'X-Auto-Response-Suppress: All'));
+        }
+    }
+
+    wp_send_json(array('success' => (bool) $sent, 'error' => $sent ? '' : 'mail'), 200);
 }
 add_action('wp_ajax_nopriv_jucca_contact', 'jucca_site_contact');
 add_action('wp_ajax_jucca_contact', 'jucca_site_contact');
