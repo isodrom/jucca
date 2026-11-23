@@ -6,7 +6,7 @@ What is in this folder
 index.html     The whole site: English and Spanish, mobile menu, contact form.
 send.php       Sends contact form messages to juccallc@yahoo.com from the web host.
 assets/        Logo and browser icons.
-images/        Site photos. IMG-01 (hero) and IMG-02 (about) are included.
+images/        All nine site photos (IMG-01 to IMG-09).
 
 
 How to put it online (GoDaddy)
@@ -59,12 +59,12 @@ Spam protection built in
 Changing things later
 ---------------------
 - Delivery address: first lines of send.php.
-- Photos: add IMG-03 to IMG-09 (.jpg or .png) to the images folder. They appear
-  automatically. Until then, product cards show an icon and the factory photo
-  is hidden.
-    IMG-03 Water purification systems     IMG-07 Replacement parts
-    IMG-04 Reverse osmosis equipment      IMG-08 Technologies and accessories
-    IMG-05 Water softeners                IMG-09 Factory floor (manufacturers)
-    IMG-06 Filters and membranes
+- Photos: replace any file in the images folder with a new one of the same
+  name (.jpg or .png). If a product photo is missing, its card shows an icon.
+    IMG-01 Hero (port)                    IMG-06 Filters and membranes
+    IMG-02 About us (warehouse)           IMG-07 Replacement parts
+    IMG-03 Water purification systems     IMG-08 Technologies and accessories
+    IMG-04 Reverse osmosis equipment      IMG-09 Factory floor (manufacturers)
+    IMG-05 Water softeners
 - Spanish text: the ES table in the script at the end of index.html.
 - "Nearly 25 years": appears twice in index.html and twice in the ES table.
